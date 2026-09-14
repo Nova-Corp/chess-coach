@@ -1014,24 +1014,23 @@ def _eval_summaries(conn, username: str, game_ids: list[int]) -> dict[int, dict]
 
 class LLMSettingsIn(BaseModel):
     provider: str  # "anthropic" | "openai" | "gemini" | "ollama"
-    api_key: str   # plaintext — encrypted before writing to DB
+    api_key: str = ""  # blank keeps the saved key for the same provider
+    model: Optional[str] = None
 
 
 @app.get("/settings/llm")
 def settings_llm_get():
-    """Return current provider and whether an API key is stored (never the key itself)."""
+    """Return provider/model settings and model choices, never the API key."""
     return get_llm_settings()
 
 
 @app.post("/settings/llm")
 def settings_llm_post(body: LLMSettingsIn):
-    valid_providers = {"anthropic", "openai", "gemini", "ollama"}
-    if body.provider not in valid_providers:
-        raise HTTPException(400, f"provider must be one of {sorted(valid_providers)}")
-    if not body.api_key.strip():
-        raise HTTPException(400, "api_key must not be empty")
-    save_llm_settings(body.provider, body.api_key.strip())
-    return {"ok": True}
+    try:
+        save_llm_settings(body.provider, body.api_key, body.model)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"ok": True, **get_llm_settings()}
 
 
 # ---------------------------------------------------------------------------

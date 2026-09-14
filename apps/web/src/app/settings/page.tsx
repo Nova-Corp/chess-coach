@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { BOARD_THEMES, useBoardTheme } from "@/lib/boardTheme";
 import { API_URL } from "@/lib/api";
 
@@ -12,6 +12,13 @@ const PROVIDERS = [
 ] as const;
 
 type Provider = (typeof PROVIDERS)[number]["value"];
+
+interface LLMSettings {
+  provider: Provider | "";
+  model: string;
+  has_api_key: boolean;
+  models: Record<Provider, string[]>;
+}
 
 function SectionHeader({ title, description }: { title: string; description: string }) {
   return (
@@ -31,38 +38,72 @@ export default function SettingsPage() {
 
   // LLM settings — stored in backend
   const [provider, setProvider] = useState<Provider>("anthropic");
+  const [model, setModel] = useState("");
+  const [customModel, setCustomModel] = useState(false);
   const [apiKey, setApiKey] = useState("");
-  const [hasStoredKey, setHasStoredKey] = useState(false);
+  const [saved, setSaved] = useState<LLMSettings | null>(null);
+  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<{ ok: boolean; msg: string } | null>(null);
 
-  useEffect(() => {
-    fetch(`${API_URL}/settings/llm`)
-      .then((r) => r.json())
-      .then((d) => {
-        if (d.provider) setProvider(d.provider as Provider);
-        setHasStoredKey(!!d.has_api_key);
-      })
-      .catch(() => {});
+  function applySettings(data: LLMSettings) {
+    const selectedProvider = data.provider || "anthropic";
+    const selectedModel = data.model || data.models[selectedProvider][0];
+    setSaved(data);
+    setProvider(selectedProvider);
+    setModel(selectedModel);
+    setCustomModel(!data.models[selectedProvider].includes(selectedModel));
+  }
+
+  const loadSettings = useCallback(async () => {
+    setLoading(true);
+    setStatus(null);
+    try {
+      const res = await fetch(`${API_URL}/settings/llm`);
+      if (!res.ok) throw new Error("Could not load AI Coach settings. Please try again.");
+      applySettings(await res.json());
+    } catch {
+      setStatus({ ok: false, msg: "Could not load AI Coach settings. Check that the API is running." });
+    } finally {
+      setLoading(false);
+    }
   }, []);
+
+  useEffect(() => { void loadSettings(); }, [loadSettings]);
+
+  const isOllama = provider === "ollama";
+  const hasStoredKey = saved?.provider === provider && saved.has_api_key;
+  const models = saved?.models[provider] ?? [];
+  const canSave = !!saved && !!model.trim() && (isOllama || !!apiKey.trim() || hasStoredKey);
+
+  function changeProvider(nextProvider: Provider) {
+    const nextModel = saved?.provider === nextProvider
+      ? saved.model
+      : saved?.models[nextProvider][0] ?? "";
+    setProvider(nextProvider);
+    setModel(nextModel);
+    setCustomModel(!saved?.models[nextProvider].includes(nextModel));
+    setApiKey("");
+    setStatus(null);
+  }
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
-    if (!apiKey.trim() && !hasStoredKey) return;
+    if (!canSave || saving) return;
     setSaving(true);
     setStatus(null);
     try {
       const res = await fetch(`${API_URL}/settings/llm`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider, api_key: apiKey }),
+        body: JSON.stringify({ provider, model: model.trim(), api_key: apiKey }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail ?? `HTTP ${res.status}`);
+        throw new Error(typeof err.detail === "string" ? err.detail : `HTTP ${res.status}`);
       }
-      setStatus({ ok: true, msg: "Saved." });
-      setHasStoredKey(true);
+      applySettings(await res.json());
+      setStatus({ ok: true, msg: "Saved. Chat and game summaries will use this model." });
       setApiKey("");
     } catch (e) {
       setStatus({ ok: false, msg: e instanceof Error ? e.message : String(e) });
@@ -70,8 +111,6 @@ export default function SettingsPage() {
       setSaving(false);
     }
   }
-
-  const isOllama = provider === "ollama";
 
   return (
     <main className="mx-auto max-w-lg px-6 py-12">
@@ -123,14 +162,17 @@ export default function SettingsPage() {
         <section>
           <SectionHeader
             title="AI Coach"
-            description="Connect an LLM to power the in-drill coaching chat. Your API key is encrypted before being stored — it never leaves your machine in plaintext."
+            description="Choose the provider and model for coaching chat and game summaries. API keys are encrypted in local storage and sent only to the selected provider."
           />
-          <form onSubmit={handleSave} className="flex flex-col gap-4">
+          {loading && <p role="status" className="mb-3 text-sm text-neutral-500">Loading settings…</p>}
+          <form onSubmit={handleSave}>
+            <fieldset disabled={loading || saving || !saved} className="flex flex-col gap-4 disabled:opacity-60">
             <div>
-              <label className="mb-1.5 block text-sm font-medium text-neutral-300">Provider</label>
+              <label htmlFor="llm-provider" className="mb-1.5 block text-sm font-medium text-neutral-300">Provider</label>
               <select
+                id="llm-provider"
                 value={provider}
-                onChange={(e) => setProvider(e.target.value as Provider)}
+                onChange={(e) => changeProvider(e.target.value as Provider)}
                 className="w-full rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm text-neutral-200 focus:outline-none focus:ring-1 focus:ring-neutral-500"
               >
                 {PROVIDERS.map((p) => (
@@ -140,47 +182,84 @@ export default function SettingsPage() {
             </div>
 
             <div>
-              <label className="mb-1.5 block text-sm font-medium text-neutral-300">
-                {isOllama ? "Model name" : "API key"}
-              </label>
-              {isOllama && (
-                <p className="mb-2 text-xs text-neutral-500">
-                  Enter the Ollama model name (e.g. <code className="rounded bg-neutral-800 px-1">llama3.2</code>).
-                  Ollama must be running locally on port 11434.
-                </p>
+              <label htmlFor="llm-model" className="mb-1.5 block text-sm font-medium text-neutral-300">Model</label>
+              <select
+                id="llm-model"
+                value={customModel ? "__custom__" : model}
+                onChange={(e) => {
+                  const custom = e.target.value === "__custom__";
+                  setCustomModel(custom);
+                  setModel(custom ? "" : e.target.value);
+                  setStatus(null);
+                }}
+                aria-describedby="llm-model-help"
+                className="w-full rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm text-neutral-200 focus:outline-none focus:ring-1 focus:ring-neutral-500"
+              >
+                {models.map((id) => <option key={id} value={id}>{id}</option>)}
+                <option value="__custom__">Custom model…</option>
+              </select>
+              {customModel && (
+                <div className="mt-3">
+                  <label htmlFor="llm-custom-model" className="mb-1.5 block text-sm font-medium text-neutral-300">Model ID</label>
+                  <input
+                    id="llm-custom-model"
+                    value={model}
+                    onChange={(e) => { setModel(e.target.value); setStatus(null); }}
+                    placeholder={isOllama ? "e.g. llama3.2:latest" : "Enter the provider’s exact model ID"}
+                    required
+                    maxLength={200}
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="w-full rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm text-neutral-200 placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-neutral-500"
+                  />
+                </div>
               )}
-              <input
-                type={isOllama ? "text" : "password"}
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder={
-                  hasStoredKey
-                    ? isOllama ? "Update model name…" : "Enter new key to replace stored key…"
-                    : isOllama ? "llama3.2" : "sk-…"
-                }
-                className="w-full rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm text-neutral-200 placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-neutral-500"
-              />
-              {hasStoredKey && (
-                <p className="mt-1.5 text-xs text-emerald-500">
-                  ✓ A key is already stored for this provider. Leave blank to keep it.
-                </p>
-              )}
+              <p id="llm-model-help" className="mt-1.5 text-xs text-neutral-500">
+                {isOllama
+                  ? "Choose a model installed in Ollama. Ollama must be running locally on port 11434; no API key is needed."
+                  : "Choose a text model available to your API account, or enter a custom model ID. Availability and pricing depend on your provider."}
+              </p>
             </div>
+
+            {!isOllama && (
+              <div>
+                <label htmlFor="llm-api-key" className="mb-1.5 block text-sm font-medium text-neutral-300">API key</label>
+                <input
+                  id="llm-api-key"
+                  type="password"
+                  value={apiKey}
+                  onChange={(e) => { setApiKey(e.target.value); setStatus(null); }}
+                  placeholder={hasStoredKey ? "Leave blank to keep your saved key…" : "Enter your API key"}
+                  required={!hasStoredKey}
+                  autoComplete="new-password"
+                  className="w-full rounded-lg border border-neutral-700 bg-neutral-900 px-3 py-2 text-sm text-neutral-200 placeholder-neutral-600 focus:outline-none focus:ring-1 focus:ring-neutral-500"
+                />
+                {hasStoredKey && (
+                  <p className="mt-1.5 text-xs text-emerald-500">✓ A key is saved for this provider. You can change models without replacing it.</p>
+                )}
+              </div>
+            )}
 
             <div className="flex items-center gap-4">
               <button
                 type="submit"
-                disabled={saving || (!apiKey.trim() && !hasStoredKey)}
+                disabled={saving || !canSave}
                 className="rounded-lg bg-emerald-700 px-5 py-2 text-sm font-semibold text-white hover:bg-emerald-600 disabled:opacity-40"
               >
                 {saving ? "Saving…" : "Save"}
               </button>
-              {status && (
-                <p className={`text-sm ${status.ok ? "text-emerald-400" : "text-red-400"}`}>
-                  {status.msg}
-                </p>
-              )}
             </div>
+            </fieldset>
+            {status && (
+              <p role={status.ok ? "status" : "alert"} className={`mt-3 text-sm ${status.ok ? "text-emerald-400" : "text-red-400"}`}>
+                {status.msg}
+              </p>
+            )}
+            {!loading && !saved && (
+              <button type="button" onClick={() => void loadSettings()} className="mt-3 text-sm text-emerald-400 underline hover:text-emerald-300">
+                Retry loading settings
+              </button>
+            )}
           </form>
         </section>
 

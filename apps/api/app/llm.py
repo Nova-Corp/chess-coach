@@ -7,8 +7,9 @@ symmetric encryption. The encryption key lives in SECRET_KEY env var (or the
 """
 
 import os
-import secrets
+import re
 from pathlib import Path
+from urllib.parse import quote
 
 import chess
 import httpx
@@ -74,44 +75,87 @@ def decrypt_value(token: str) -> str:
 # Settings helpers (app_settings table)
 # ---------------------------------------------------------------------------
 
+# The first option is the default. Custom provider model IDs are also accepted.
+MODEL_OPTIONS = {
+    "anthropic": ["claude-haiku-4-5-20251001", "claude-sonnet-5", "claude-opus-5"],
+    "openai": ["gpt-4o-mini", "gpt-4.1-mini"],
+    "gemini": ["gemini-2.5-flash-lite", "gemini-3.5-flash-lite"],
+    "ollama": ["llama3.2"],
+}
+DEFAULT_MODELS = {provider: models[0] for provider, models in MODEL_OPTIONS.items()}
+
+
+def _read_llm_settings(conn) -> dict:
+    return dict(conn.execute(
+        "SELECT key, value FROM app_settings"
+        " WHERE key IN ('llm_provider', 'llm_api_key', 'llm_model')"
+    ).fetchall())
+
+
+def _saved_model(data: dict) -> str:
+    if data.get("llm_model"):
+        return data["llm_model"]
+    provider = data.get("llm_provider", "")
+    # Older installations stored the Ollama model in the encrypted key field.
+    if provider == "ollama" and data.get("llm_api_key"):
+        return decrypt_value(data["llm_api_key"])
+    return DEFAULT_MODELS.get(provider, "")
+
+
 def get_llm_settings() -> dict:
     with conn_ctx() as conn:
-        rows = conn.execute(
-            "SELECT key, value FROM app_settings WHERE key IN ('llm_provider', 'llm_api_key')"
-        ).fetchall()
-    data = {r["key"]: r["value"] for r in rows}
+        data = _read_llm_settings(conn)
     provider = data.get("llm_provider", "")
-    has_key = bool(data.get("llm_api_key", ""))
-    return {"provider": provider, "has_api_key": has_key}
+    return {
+        "provider": provider,
+        "model": _saved_model(data),
+        "has_api_key": provider != "ollama" and bool(data.get("llm_api_key")),
+        "models": MODEL_OPTIONS,
+    }
 
 
-def save_llm_settings(provider: str, api_key: str) -> None:
-    encrypted = encrypt_value(api_key)
+def save_llm_settings(provider: str, api_key: str = "", model: str | None = None) -> None:
+    if provider not in MODEL_OPTIONS:
+        raise ValueError(f"provider must be one of {sorted(MODEL_OPTIONS)}")
+    api_key = api_key.strip()
     with conn_ctx() as conn:
-        conn.execute(
-            "INSERT INTO app_settings(key, value) VALUES('llm_provider', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (provider,),
+        previous = _read_llm_settings(conn)
+        same_provider = previous.get("llm_provider") == provider
+        previous_model = _saved_model(previous)
+        if model is None:
+            # Continue accepting the old Ollama settings request shape.
+            model = (api_key if provider == "ollama" and api_key else
+                     previous_model if same_provider else DEFAULT_MODELS[provider])
+        model = model.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}", model):
+            raise ValueError("Enter a valid model ID (up to 200 characters, without spaces).")
+        if provider == "ollama":
+            encrypted = ""
+        elif api_key:
+            encrypted = encrypt_value(api_key)
+        elif same_provider and previous.get("llm_api_key"):
+            encrypted = previous["llm_api_key"]
+        else:
+            raise ValueError("An API key is required for this provider.")
+        conn.executemany(
+            "INSERT INTO app_settings(key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [("llm_provider", provider), ("llm_api_key", encrypted), ("llm_model", model)],
         )
-        conn.execute(
-            "INSERT INTO app_settings(key, value) VALUES('llm_api_key', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (encrypted,),
-        )
+        # Summaries should be generated with the newly selected provider/model.
+        if not same_provider or model != previous_model:
+            conn.execute("DELETE FROM narratives")
 
 
-def _get_api_key() -> tuple[str, str]:
-    """Return (provider, plaintext_api_key). Raises ValueError if not configured."""
+def _get_llm_config() -> tuple[str, str, str]:
+    """Read provider, decrypted key, and model together for one generation."""
     with conn_ctx() as conn:
-        rows = conn.execute(
-            "SELECT key, value FROM app_settings WHERE key IN ('llm_provider', 'llm_api_key')"
-        ).fetchall()
-    data = {r["key"]: r["value"] for r in rows}
+        data = _read_llm_settings(conn)
     provider = data.get("llm_provider", "")
     raw = data.get("llm_api_key", "")
-    if not provider or not raw:
+    if provider not in MODEL_OPTIONS or (provider != "ollama" and not raw):
         raise ValueError("LLM provider not configured. Visit /settings to set your API key.")
-    return provider, decrypt_value(raw)
+    return provider, decrypt_value(raw) if provider != "ollama" else "", _saved_model(data)
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +446,7 @@ async def chat(
     user_color: str | None = None,
     motif_details: dict | None = None,
 ) -> str:
-    provider, api_key = _get_api_key()
+    provider, api_key, model = _get_llm_config()
 
     # Resolve current eval from candidates if not provided directly
     if eval_cp is None and candidates:
@@ -486,18 +530,18 @@ async def chat(
     )
 
     if provider == "anthropic":
-        return await _chat_anthropic(api_key, user_content)
+        return await _chat_anthropic(api_key, user_content, model)
     elif provider == "openai":
-        return await _chat_openai(api_key, user_content)
+        return await _chat_openai(api_key, user_content, model)
     elif provider == "gemini":
-        return await _chat_gemini(api_key, user_content)
+        return await _chat_gemini(api_key, user_content, model)
     elif provider == "ollama":
-        return await _chat_ollama(api_key, user_content)
+        return await _chat_ollama(api_key, user_content, model)
     else:
         raise ValueError(f"Unknown provider: {provider!r}")
 
 
-async def _chat_anthropic(api_key: str, user_content: str) -> str:
+async def _chat_anthropic(api_key: str, user_content: str, model: str) -> str:
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -507,24 +551,24 @@ async def _chat_anthropic(api_key: str, user_content: str) -> str:
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-haiku-4-5-20251001",
+                "model": model,
                 "max_tokens": 800,
                 "system": SYSTEM_PROMPT,
                 "messages": [{"role": "user", "content": user_content}],
             },
         )
     r.raise_for_status()
-    return r.json()["content"][0]["text"]
+    return "".join(block["text"] for block in r.json()["content"] if block.get("type") == "text")
 
 
-async def _chat_openai(api_key: str, user_content: str) -> str:
+async def _chat_openai(api_key: str, user_content: str, model: str) -> str:
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "content-type": "application/json"},
             json={
-                "model": "gpt-4o-mini",
-                "max_tokens": 800,
+                "model": model,
+                "max_completion_tokens": 800,
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_content},
@@ -535,11 +579,11 @@ async def _chat_openai(api_key: str, user_content: str) -> str:
     return r.json()["choices"][0]["message"]["content"]
 
 
-async def _chat_gemini(api_key: str, user_content: str) -> str:
+async def _chat_gemini(api_key: str, user_content: str, model: str) -> str:
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
-            headers={"content-type": "application/json"},
+            f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model, safe='')}:generateContent",
+            headers={"content-type": "application/json", "x-goog-api-key": api_key},
             json={
                 "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
                 "contents": [{"parts": [{"text": user_content}]}],
@@ -550,10 +594,7 @@ async def _chat_gemini(api_key: str, user_content: str) -> str:
     return r.json()["candidates"][0]["content"]["parts"][0]["text"]
 
 
-async def _chat_ollama(api_key: str, user_content: str) -> str:
-    # For Ollama, api_key holds the model name (e.g. "llama3.2") and it runs
-    # locally — no auth required.
-    model = api_key or "llama3.2"
+async def _chat_ollama(api_key: str, user_content: str, model: str) -> str:
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
             "http://localhost:11434/api/chat",
@@ -627,7 +668,7 @@ async def narrative(
     key_positions: list[dict],  # [{label, fen, eval_cp, move_num}]
     dominant_motifs: list[str],
 ) -> str:
-    provider, api_key = _get_api_key()
+    provider, api_key, model = _get_llm_config()
 
     player_color = "White" if white.lower() == player_username.lower() else "Black"
     result_label = "White won" if result == "1-0" else "Black won" if result == "0-1" else "Draw"
@@ -650,18 +691,18 @@ async def narrative(
     )
 
     if provider == "anthropic":
-        return await _narrative_anthropic(api_key, content)
+        return await _narrative_anthropic(api_key, content, model)
     elif provider == "openai":
-        return await _narrative_openai(api_key, content)
+        return await _narrative_openai(api_key, content, model)
     elif provider == "gemini":
-        return await _narrative_gemini(api_key, content)
+        return await _narrative_gemini(api_key, content, model)
     elif provider == "ollama":
-        return await _narrative_ollama(api_key, content)
+        return await _narrative_ollama(api_key, content, model)
     else:
         raise ValueError(f"Unknown provider: {provider!r}")
 
 
-async def _narrative_anthropic(api_key: str, content: str) -> str:
+async def _narrative_anthropic(api_key: str, content: str, model: str) -> str:
     async with httpx.AsyncClient(timeout=45) as client:
         r = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -671,24 +712,24 @@ async def _narrative_anthropic(api_key: str, content: str) -> str:
                 "content-type": "application/json",
             },
             json={
-                "model": "claude-haiku-4-5-20251001",
+                "model": model,
                 "max_tokens": 700,
                 "system": NARRATIVE_SYSTEM_PROMPT,
                 "messages": [{"role": "user", "content": content}],
             },
         )
     r.raise_for_status()
-    return r.json()["content"][0]["text"]
+    return "".join(block["text"] for block in r.json()["content"] if block.get("type") == "text")
 
 
-async def _narrative_openai(api_key: str, content: str) -> str:
+async def _narrative_openai(api_key: str, content: str, model: str) -> str:
     async with httpx.AsyncClient(timeout=45) as client:
         r = await client.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "content-type": "application/json"},
             json={
-                "model": "gpt-4o-mini",
-                "max_tokens": 700,
+                "model": model,
+                "max_completion_tokens": 700,
                 "messages": [
                     {"role": "system", "content": NARRATIVE_SYSTEM_PROMPT},
                     {"role": "user", "content": content},
@@ -699,11 +740,11 @@ async def _narrative_openai(api_key: str, content: str) -> str:
     return r.json()["choices"][0]["message"]["content"]
 
 
-async def _narrative_gemini(api_key: str, content: str) -> str:
+async def _narrative_gemini(api_key: str, content: str, model: str) -> str:
     async with httpx.AsyncClient(timeout=45) as client:
         r = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}",
-            headers={"content-type": "application/json"},
+            f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model, safe='')}:generateContent",
+            headers={"content-type": "application/json", "x-goog-api-key": api_key},
             json={
                 "system_instruction": {"parts": [{"text": NARRATIVE_SYSTEM_PROMPT}]},
                 "contents": [{"parts": [{"text": content}]}],
@@ -714,8 +755,7 @@ async def _narrative_gemini(api_key: str, content: str) -> str:
     return r.json()["candidates"][0]["content"]["parts"][0]["text"]
 
 
-async def _narrative_ollama(api_key: str, content: str) -> str:
-    model = api_key or "llama3.2"
+async def _narrative_ollama(api_key: str, content: str, model: str) -> str:
     async with httpx.AsyncClient(timeout=90) as client:
         r = await client.post(
             "http://localhost:11434/api/chat",
