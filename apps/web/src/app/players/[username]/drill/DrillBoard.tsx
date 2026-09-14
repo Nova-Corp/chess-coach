@@ -7,19 +7,19 @@ import DrillChat from "./DrillChat";
 import { useBoardTheme } from "@/lib/boardTheme";
 import { API_URL } from "@/lib/api";
 import { candidateEvalLabel } from "@/lib/eval";
-import { applyUci, sideFromFen, fenAfterUcis } from "@/lib/chess";
+import { applyUci, sideFromFen, fenAfterUcis, uciToSan } from "@/lib/chess";
 import { formatMotif } from "@/lib/motifs";
 import { useEngineEval } from "@/hooks/useEngineEval";
 import ExploreBreadcrumb from "@/components/ExploreBreadcrumb";
 
 interface DrillItem {
   type: "lichess_puzzle" | "own_game";
-  puzzle_id?: string;
+  puzzle_id: string;
   game_id?: number;
   ply?: number;
   fen: string;
-  solution_moves?: string[]; // UCI for lichess puzzles
-  best_move?: string;
+  solution_moves: string[]; // UCI for both puzzle sources
+  best_move?: string; // SAN for coach context
   played_move?: string;
   classification?: string;
   eval_cp?: number | null;
@@ -140,11 +140,7 @@ export default function DrillBoard({
     return () => clearTimeout(timer);
   }, [chess, currentItem, opponentMoveDone]);
 
-  const solution: string[] = (() => {
-    if (!currentItem) return [];
-    if (currentItem.type === "lichess_puzzle") return currentItem.solution_moves ?? [];
-    return currentItem.best_move ? [currentItem.best_move] : [];
-  })();
+  const solution = currentItem?.solution_moves ?? [];
 
   function onDrop(sourceSquare: string, targetSquare: string): boolean {
     if (phase !== "solving" || !chess || !opponentMoveDone) return false;
@@ -157,12 +153,13 @@ export default function DrillBoard({
 
     if (normalizedAttempt !== normalizedExpected) {
       setPhase("wrong");
-      setWrongMsg(`Not the best move. The answer was ${expected}.`);
+      setWrongMsg(`Not the best move. The answer was ${uciToSan(chess.fen(), expected)}.`);
+      recordAttempt(false);
       return false;
     }
 
     const c = new Chess(chess.fen());
-    applyUci(c, expected);
+    if (!applyUci(c, expected)) return false;
     setChess(c);
     setFen(c.fen());
     const nextIdx = solutionIdx + 1;
@@ -191,10 +188,7 @@ export default function DrillBoard({
 
   function recordAttempt(solved: boolean) {
     if (!currentItem) return;
-    const pid =
-      currentItem.type === "lichess_puzzle"
-        ? currentItem.puzzle_id
-        : currentItem.game_id?.toString();
+    const pid = currentItem.puzzle_id;
     if (!pid) return;
     fetch(`${API_URL}/puzzle_attempts`, {
       method: "POST",

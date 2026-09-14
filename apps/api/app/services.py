@@ -215,7 +215,7 @@ def ensure_lichess_puzzles(
 
     unused: int = conn.execute(
         f"SELECT COUNT(*) FROM puzzles p"
-        f" WHERE ({like_clauses})"
+        f" WHERE p.source = 'lichess' AND ({like_clauses})"
         f"   AND NOT EXISTS ("
         f"     SELECT 1 FROM puzzle_attempts pa"
         f"     WHERE pa.puzzle_id = p.id AND pa.username = ?"
@@ -266,7 +266,7 @@ def lichess_puzzles_for_motif(
 
     return conn.execute(
         f"SELECT p.id, p.fen, p.solution_moves, p.themes FROM puzzles p"
-        f" WHERE ({like_clauses}){attempted_filter}"
+        f" WHERE p.source = 'lichess' AND ({like_clauses}){attempted_filter}"
         f" ORDER BY RANDOM() LIMIT ?",
         like_params + attempted_params + [limit],
     ).fetchall()

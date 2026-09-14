@@ -623,6 +623,8 @@ def get_player_drill(
             own_params + [max(1, limit // 3)],
         ).fetchall()
         for or_ in own_rows:
+            if not or_["best_move"]:
+                continue
             try:
                 tags = json.loads(or_["motif_tags"] or "[]")
             except (json.JSONDecodeError, TypeError):
@@ -633,6 +635,17 @@ def get_player_drill(
                 motif_details = {}
             fen = or_["fen"]
             board = chess.Board(fen)
+            # A game can supply multiple exercises. Give each position its own
+            # stable ID in the same table used by the attempt endpoint.
+            puzzle_id = f"own_game:{or_['game_id']}:{or_['ply']}"
+            conn.execute(
+                "INSERT INTO puzzles (id, source, fen, solution_moves, themes)"
+                " VALUES (?, 'own_game', ?, ?, ?)"
+                " ON CONFLICT(id) DO UPDATE SET"
+                " fen = excluded.fen, solution_moves = excluded.solution_moves,"
+                " themes = excluded.themes",
+                (puzzle_id, fen, or_["best_move"], json.dumps(tags)),
+            )
 
             def _san1(uci: str | None) -> str | None:
                 if not uci:
@@ -645,9 +658,11 @@ def get_player_drill(
             items.append(
                 {
                     "type": "own_game",
+                    "puzzle_id": puzzle_id,
                     "game_id": or_["game_id"],
                     "ply": or_["ply"],
                     "fen": fen,
+                    "solution_moves": [or_["best_move"]],
                     "best_move": _san1(or_["best_move"]),
                     "played_move": _san1(or_["played_move"]),
                     "classification": or_["classification"],
